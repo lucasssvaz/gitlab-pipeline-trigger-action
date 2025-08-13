@@ -1,4 +1,8 @@
 const core = require('@actions/core');
+const io = require('@actions/io');
+const fs = require('fs');
+const path = require('path');
+const AdmZip = require('adm-zip');
 
 const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -68,6 +72,177 @@ const pollPipeline = async (host, projectId, token, pipelineId, webUrl) => {
     return status;
 }
 
+/**
+ * Downloads job logs from a GitLab pipeline job
+ * @param {string} host - GitLab host
+ * @param {string} projectId - Project ID
+ * @param {string} token - Access token
+ * @param {string} jobId - Job ID
+ * @param {string} jobName - Job name
+ * @param {string} jobLogsPath - Path to save job logs
+ * @returns {Promise<boolean>} - Whether job logs were downloaded successfully
+ */
+const downloadJobLogs = async (host, projectId, token, jobId, jobName, jobLogsPath) => {
+    try {
+        console.log(`Downloading logs for job: ${jobName} (${jobId})`);
+        
+        const logUrl = `https://${host}/api/v4/projects/${projectId}/jobs/${jobId}/trace`;
+        const logResponse = await fetch(logUrl, {
+            method: 'GET',
+            headers: {
+                'PRIVATE-TOKEN': token,
+                'Accept': 'text/plain',
+            },
+        });
+
+        if (!logResponse.ok) {
+            console.log(`Failed to download logs for job ${jobName}: ${logResponse.status}`);
+            return false;
+        }
+
+        const logContent = await logResponse.text();
+        const logFilePath = path.join(jobLogsPath, 'job.log');
+        
+        fs.writeFileSync(logFilePath, logContent);
+        console.log(`Successfully downloaded logs for job: ${jobName}`);
+        return true;
+        
+    } catch (error) {
+        console.log(`Error downloading logs for job ${jobName}: ${error.message}`);
+        return false;
+    }
+};
+
+/**
+ * Downloads artifacts from a GitLab pipeline job
+ * @param {string} host - GitLab host
+ * @param {string} projectId - Project ID
+ * @param {string} token - Access token
+ * @param {string} pipelineId - Pipeline ID
+ * @param {string} downloadPath - Path to save artifacts and logs
+ * @param {boolean} downloadJobLogsFlag - Whether to download job logs
+ * @returns {Promise<boolean>} - Whether artifacts were downloaded successfully
+ */
+const downloadArtifacts = async (host, projectId, token, pipelineId, downloadPath, downloadJobLogsFlag) => {
+    try {
+        console.log(`Downloading artifacts for pipeline ${pipelineId}...`);
+        
+        // First, get the pipeline jobs to find which ones have artifacts
+        const jobsUrl = `https://${host}/api/v4/projects/${projectId}/pipelines/${pipelineId}/jobs`;
+        const jobsResponse = await fetch(jobsUrl, {
+            method: 'GET',
+            headers: {
+                'PRIVATE-TOKEN': token,
+                'Accept': 'application/json',
+            },
+        });
+
+        if (!jobsResponse.ok) {
+            console.log(`Failed to fetch jobs: ${jobsResponse.status}`);
+            return false;
+        }
+
+        const jobs = await jobsResponse.json();
+        const jobsWithArtifacts = jobs.filter(job => job.artifacts_file && job.artifacts_file.filename);
+
+        if (jobsWithArtifacts.length === 0 && !downloadJobLogsFlag) {
+            console.log('No jobs with artifacts found and job logs not requested');
+            return false;
+        }
+
+        // Create download directory
+        await io.mkdirP(downloadPath);
+
+        let downloadedCount = 0;
+        let logsDownloadedCount = 0;
+        
+        // Download artifacts from jobs that have them
+        for (const job of jobsWithArtifacts) {
+            try {
+                console.log(`Downloading artifacts from job: ${job.name} (${job.id})`);
+                
+                const artifactUrl = `https://${host}/api/v4/projects/${projectId}/jobs/${job.id}/artifacts`;
+                const artifactResponse = await fetch(artifactUrl, {
+                    method: 'GET',
+                    headers: {
+                        'PRIVATE-TOKEN': token,
+                        'Accept': 'application/octet-stream',
+                    },
+                });
+
+                if (!artifactResponse.ok) {
+                    console.log(`Failed to download artifacts for job ${job.name}: ${artifactResponse.status}`);
+                    continue;
+                }
+
+                const artifactBuffer = await artifactResponse.arrayBuffer();
+                const jobArtifactsPath = path.join(downloadPath, `job_${job.id}_${job.name.replace(/[^a-zA-Z0-9]/g, '_')}`);
+                
+                // Create job-specific directory
+                await io.mkdirP(jobArtifactsPath);
+                
+                // Save the zip file
+                const zipPath = path.join(jobArtifactsPath, 'artifacts.zip');
+                fs.writeFileSync(zipPath, Buffer.from(artifactBuffer));
+                
+                // Extract the zip file
+                const zip = new AdmZip(zipPath);
+                zip.extractAllTo(jobArtifactsPath, true);
+                
+                // Remove the zip file after extraction
+                fs.unlinkSync(zipPath);
+                
+                console.log(`Successfully downloaded artifacts for job: ${job.name}`);
+                downloadedCount++;
+                
+            } catch (error) {
+                console.log(`Error downloading artifacts for job ${job.name}: ${error.message}`);
+            }
+        }
+
+        // Download job logs if requested
+        if (downloadJobLogsFlag) {
+            console.log('Downloading job logs...');
+            for (const job of jobs) {
+                try {
+                    const jobLogsPath = path.join(downloadPath, `job_${job.id}_${job.name.replace(/[^a-zA-Z0-9]/g, '_')}`);
+                    
+                    // Create job directory if it doesn't exist (for jobs without artifacts)
+                    if (!jobsWithArtifacts.find(j => j.id === job.id)) {
+                        await io.mkdirP(jobLogsPath);
+                    }
+                    
+                    const logDownloaded = await downloadJobLogs(host, projectId, token, job.id, job.name, jobLogsPath);
+                    if (logDownloaded) {
+                        logsDownloadedCount++;
+                    }
+                } catch (error) {
+                    console.log(`Error processing logs for job ${job.name}: ${error.message}`);
+                }
+            }
+        }
+
+        if (downloadedCount > 0 || logsDownloadedCount > 0) {
+            const summary = [];
+            if (downloadedCount > 0) {
+                summary.push(`artifacts from ${downloadedCount} jobs`);
+            }
+            if (logsDownloadedCount > 0) {
+                summary.push(`logs from ${logsDownloadedCount} jobs`);
+            }
+            console.log(`Successfully downloaded ${summary.join(' and ')} to ${downloadPath}`);
+            return true;
+        } else {
+            console.log('No artifacts or logs were successfully downloaded');
+            return false;
+        }
+        
+    } catch (error) {
+        console.log(`Error downloading artifacts: ${error.message}`);
+        return false;
+    }
+};
+
 async function run() {
     const host = encodeURIComponent(core.getInput('host'));
     const projectId = encodeURIComponent(core.getInput('id'));
@@ -75,8 +250,33 @@ async function run() {
     const accessToken = core.getInput('access_token');
     const ref = core.getInput('ref');
     const variables = JSON.parse(core.getInput('variables'));
+    const downloadArtifactsFlag = core.getInput('download_artifacts') === 'true';
+    const downloadArtifactsOnFailure = core.getInput('download_artifacts_on_failure') === 'true';
+    const downloadJobLogsFlag = core.getInput('download_job_logs') === 'true';
+    const failIfNoArtifacts = core.getInput('fail_if_no_artifacts') === 'true';
+    const downloadPath = core.getInput('download_path');
 
     console.log(`Triggering pipeline ${projectId} with ref ${ref} on ${host}!`);
+    
+    if (downloadArtifactsFlag && !accessToken) {
+        core.setFailed('download_artifacts is enabled but access_token is not provided. Access token is required to download artifacts.');
+        return;
+    }
+    
+    if (downloadJobLogsFlag && !accessToken) {
+        core.setFailed('download_job_logs is enabled but access_token is not provided. Access token is required to download job logs.');
+        return;
+    }
+    
+    if (downloadArtifactsOnFailure && !downloadArtifactsFlag) {
+        core.setFailed('download_artifacts_on_failure is enabled but download_artifacts is not enabled. download_artifacts must be enabled to use download_artifacts_on_failure.');
+        return;
+    }
+    
+    if (failIfNoArtifacts && !downloadArtifactsFlag) {
+        core.setFailed('fail_if_no_artifacts is enabled but download_artifacts is not enabled. download_artifacts must be enabled to use fail_if_no_artifacts.');
+        return;
+    }
 
     try {
         const url = `https://${host}/api/v4/projects/${projectId}/trigger/pipeline`;
@@ -110,7 +310,42 @@ async function run() {
         console.log(`Pipeline id ${data.id} triggered! See ${data.web_url} for details.`);
 
         // poll pipeline status
-        await pollPipeline(host, projectId, accessToken, data.id, data.web_url);
+        const finalStatus = await pollPipeline(host, projectId, accessToken, data.id, data.web_url);
+        
+        // Download artifacts if enabled
+        if (downloadArtifactsFlag) {
+            let shouldDownload = false;
+            let downloadReason = '';
+            
+            if (finalStatus === 'success') {
+                shouldDownload = true;
+                downloadReason = 'Pipeline succeeded';
+            } else if (downloadArtifactsOnFailure && finalStatus === 'failed') {
+                shouldDownload = true;
+                downloadReason = 'Pipeline failed but artifacts download on failure is enabled';
+            }
+            
+            if (shouldDownload) {
+                console.log(`${downloadReason}, downloading artifacts...`);
+                const artifactsDownloaded = await downloadArtifacts(host, projectId, accessToken, data.id, downloadPath, downloadJobLogsFlag);
+                core.setOutput("artifacts_downloaded", artifactsDownloaded.toString());
+                
+                if (artifactsDownloaded) {
+                    console.log(`Artifacts and logs downloaded successfully to ${downloadPath}`);
+                } else {
+                    console.log('No artifacts or logs were downloaded');
+                    
+                    // Fail the action if no artifacts found and fail_if_no_artifacts is enabled
+                    if (failIfNoArtifacts) {
+                        core.setFailed('No artifacts were found and fail_if_no_artifacts is enabled. This may indicate a configuration issue or that the pipeline did not generate expected artifacts.');
+                        return;
+                    }
+                }
+            } else {
+                console.log(`Pipeline status is ${finalStatus}, skipping artifact download`);
+                core.setOutput("artifacts_downloaded", "false");
+            }
+        }
     } catch (error) {
         core.setFailed(error.message);
     }
