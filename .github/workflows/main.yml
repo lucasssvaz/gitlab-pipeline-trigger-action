@@ -19,16 +19,17 @@ jobs:
         id: test
         with:
           # Triggers https://gitlab.com/digital-blueprint/gitlab-pipeline-trigger-action-example/-/pipelines
-          host: 'gitlab.com'
-          trigger_token: ${{ secrets.DEPLOY_TRIGGER_TOKEN }}
+          host: ${{ secrets.GITLAB_URL }}
+          trigger_token: ${{ secrets.GITLAB_TRIGGER_TOKEN }}
           # Access token is required for private repositories and downloading artifacts/logs.
-          access_token: ${{ secrets.DEPLOY_ACCESS_TOKEN }}
-          id: '44347238'
-          ref: 'main'
+          access_token: ${{ secrets.GITLAB_ACCESS_TOKEN }}
+          id: ${{ secrets.GITLAB_PROJECT_ID }}
+          ref: master
           variables: '{"VAR1":"value1","VAR2":"value2"}'
-          download_artifacts: 'true'
-          download_job_logs: 'true'
-          download_path: './gitlab-artifacts'
+          download_artifacts: true
+          download_job_logs: true
+          download_path: ./gitlab-artifacts
+          verbose: false
 
       - name: List downloaded artifacts and job logs
         run: |
